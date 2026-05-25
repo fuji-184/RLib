@@ -236,7 +236,7 @@ fn main() {
                         exit(1);
                     }
                 },
-                _ => > {
+                _ => {
                     let mut run_args = vec![args[0].clone(), "rlib.list".to_string()];
                     run_args.extend(args[2..].iter().cloned());
                     cmd_run(run_args);
