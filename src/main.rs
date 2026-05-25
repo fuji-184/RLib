@@ -196,12 +196,15 @@ fn main() {
         "--help" | "-h" | "help" => print_help(),
 
         "init" => {
-            let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
-            match sub {
-                "list" => cmd_init_list(),
-                "config" => cmd_init_config(),
+            match args.get(2).map(|s| s.as_str()) {
+                Some("list") => cmd_init_list(),
+                Some("config") => cmd_init_config(),
+                Some("") | None => {
+                    cmd_init_config();
+                    cmd_init_list();
+                }
                 _ => {
-                    eprintln!("[rlib] Usage: rlib init list | rlib init config");
+                    eprintln!("[rlib] Usage: rlib init | rlib init list | rlib init config");
                     exit(1);
                 }
             }
@@ -212,6 +215,31 @@ fn main() {
                 cmd_list_file(&args[2]);
             } else {
                 cmd_list_json();
+            }
+        }
+        
+        "this" => {
+            if args.len() < 4 {
+                eprintln!("[rlib] Usage: rlib this add <key> | rlib this remove <key>");
+                exit(1);
+            }
+            let sub_cmd = &args[2];
+            let key = &args[3];
+            match sub_cmd.as_str() {
+                "add" => cmd_list_add("rlib.list", key),
+                "remove" => cmd_list_remove("rlib.list", key),
+                "print" => {
+                    if args.len() == 5 && args[3] == "for" && args[4] == "cargo" {
+                        cmd_print_for_cargo("rlib.list");
+                    } else {
+                        eprintln!("[rlib] Unknown command. Did you mean 'rlib this print for cargo'?");
+                        exit(1);
+                    }
+                },
+                _ => {
+                    eprintln!("[rlib] Unknown sub-command for 'this'. Use 'add' or 'remove'.");
+                    exit(1);
+                }
             }
         }
 
@@ -253,8 +281,8 @@ fn print_help() {
 BUILDING
   rlib <lib_name> [features=a,b,c]
       Build <lib_name> as a release .rlib, copy all deps to
-      ~/rlib/<lib>_<version>_<features>/, and save the rustc
-      flags to ~/rlib/list.json.
+      ~/.rlib/<lib>_<version>_<features>/, and save the rustc
+      flags to ~/.rlib/list.json.
 
       Examples:
         rlib tokio features=full
@@ -264,7 +292,7 @@ BUILDING
 RUNNING CARGO WITH RLIB FLAGS
   rlib <rlib.list> <cargo sub-command...> [nightly]
       Read library keys from <rlib.list> (one per line), look them
-      up in ~/rlib/list.json, combine their rustc flags plus the
+      up in ~/.rlib/list.json, combine their rustc flags plus the
       settings from rlib.config in the current directory, inject them
       as RUSTFLAGS, then execute the cargo command.
       Lines starting with # are treated as comments and ignored.
@@ -278,6 +306,10 @@ RUNNING CARGO WITH RLIB FLAGS
         rlib mylibs.list cargo build nightly
 
 INITIALISING
+  rlib init
+      Create both rlib.config and rlib.list in the current directory
+      with default values and usage instructions.
+      
   rlib init list
       Create rlib.list in the current directory with usage instructions
       as comments inside the file.
@@ -288,17 +320,28 @@ INITIALISING
 
 INSPECTING
   rlib list
-      Print all keys currently stored in ~/rlib/list.json.
+      Print all keys currently stored in ~/.rlib/list.json.
 
   rlib list <rlib.list>
       Print the active (non-comment) keys in <rlib.list>.
 
 MANAGING list.json
   rlib remove <key>
-      Remove <key> from ~/rlib/list.json AND delete its folder
-      ~/rlib/<key>/ from disk.
+      Remove <key> from ~/.rlib/list.json AND delete its folder
+      ~/.rlib/<key>/ from disk.
+      
+MANAGING CURRENT DIRECTORY LIST
+  rlib this add <key>
+      Append <key> to 'rlib.list' in the current directory (no duplicates).
 
-MANAGING A .list FILE
+  rlib this remove <key>
+      Remove <key> from 'rlib.list' in the current directory.
+      
+  rlib this print for cargo
+      Clear the terminal and print all libraries in 'rlib.list' as
+      Cargo.toml [dependencies] entries ready to copy-paste.
+
+MANAGING A SPECIFIC .list FILE
   rlib <rlib.list> add <key>
       Append <key> to <rlib.list> (no duplicates).
 
@@ -323,26 +366,8 @@ fn cmd_init_list() {
     }
 
     let template = "\
-# rlib.list — library dependency list for rlib
-#
-# Each non-comment line is a key that maps to an entry in ~/rlib/list.json.
-# Keys are generated automatically when you run:
-#
-#   rlib <lib_name> [features=a,b,c]
-#
-# Lines starting with # are comments and are ignored by all rlib commands.
-# Blank lines are also ignored.
-#
-# USAGE EXAMPLES
-#
-#   Run cargo with all libraries in this file injected as RUSTFLAGS:
-#      rlib rlib.list cargo run
-#      rlib rlib.list cargo check
-#      rlib rlib.list cargo build
-#
-#   Run with nightly-only flags enabled (-Z flags, cranelift backend):
-#      rlib rlib.list cargo run nightly
-#      rlib rlib.list cargo build nightly
+#   Show active keys in this file:
+#      rlib list rlib.list
 #
 #   Add a key to this file (after building it with rlib):
 #      rlib rlib.list add tokio_1_52_3_full
@@ -350,10 +375,9 @@ fn cmd_init_list() {
 #   Remove a key from this file:
 #      rlib rlib.list remove tokio_1_52_3_full
 #
-#   Show active keys in this file:
-#      rlib list rlib.list
-#
 # Add your library keys below:
+
+
 ";
 
     fs::write(dest, template).unwrap_or_else(|e| {
@@ -372,35 +396,27 @@ fn cmd_init_config() {
     }
 
     let template = "\
-# rlib.config — compiler configuration for rlib
-#
-# This file is read by rlib when running:
-#   rlib <rlib.list> cargo run|check|build [nightly]
-#
-# Settings here are combined with library flags from rlib.list and
-# injected into RUSTFLAGS automatically.
-#
-# Lines starting with # are comments and are ignored.
-# Blank lines are also ignored.
-
 # backend — codegen backend to use.
 # Values : llvm | cranelift
 # Default: cranelift
 # Note   : cranelift is only active when running with 'nightly' keyword.
 #          On stable, llvm is always used regardless of this setting.
+
 backend=cranelift
 
 # linker — linker to use for faster linking.
 # Values : lld | mold | wild
 # Default: mold
+
 linker=mold
 
-# allocator — global memory allocator via LD_PRELOAD.
+# allocator — global memory allocator for the compiler.
 # Values : jemalloc | mimalloc | tcmalloc
 # Default: jemalloc
-# Note   : jemalloc is Rust's default allocator on Linux; no LD_PRELOAD
-#          is injected for it. mimalloc and tcmalloc require the shared
+# Note   : jemalloc is the compiler default allocator on Linux
+#          mimalloc and tcmalloc require the shared
 #          library to be installed on the system.
+
 allocator=jemalloc
 ";
 
@@ -414,7 +430,7 @@ allocator=jemalloc
 
 fn cmd_list_json() {
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let list_json = PathBuf::from(&home).join("rlib").join("list.json");
+    let list_json = PathBuf::from(&home).join(".rlib").join("list.json");
     let map = load_list(&list_json);
 
     if map.is_empty() {
@@ -424,7 +440,7 @@ fn cmd_list_json() {
 
     let mut keys: Vec<&String> = map.keys().collect();
     keys.sort();
-    println!("[rlib] Entries in ~/rlib/list.json ({}):", keys.len());
+    println!("[rlib] Entries in ~/.rlib/list.json ({}):", keys.len());
     for k in keys {
         println!("  {}", k);
     }
@@ -454,7 +470,7 @@ fn cmd_list_file(list_path: &str) {
 
 fn cmd_remove_key(key: &str) {
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let rlib_base = PathBuf::from(&home).join("rlib");
+    let rlib_base = PathBuf::from(&home).join(".rlib");
     let list_json = rlib_base.join("list.json");
 
     let mut map = load_list(&list_json);
@@ -483,8 +499,8 @@ fn cmd_list_add(list_path: &str, key: &str) {
     let existing = fs::read_to_string(list_path).unwrap_or_default();
 
     if active_lines(&existing).contains(&key) {
-        println!("[rlib] '{}' is already in '{}'.", key, list_path);
-        return;
+        eprintln!("[rlib] Error: Key '{}' already exists in '{}'. Connection rejected.", key, list_path);
+        exit(1);
     }
 
     let mut new_content = existing;
@@ -559,7 +575,7 @@ fn cmd_run(args: Vec<String>) {
     }
 
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let list_json = PathBuf::from(&home).join("rlib").join("list.json");
+    let list_json = PathBuf::from(&home).join(".rlib").join("list.json");
     let all_entries = load_list(&list_json);
 
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -570,13 +586,13 @@ fn cmd_run(args: Vec<String>) {
         cfg.backend = "llvm".to_string();
     }
 
-    let mut combined_flags: Vec<String> = Vec::new();
+    let mut combined_flags: Vec<&str> = Vec::new();
     let config_flags = build_config_flags(&cfg);
-    combined_flags.extend(config_flags.split_whitespace().map(String::from));
+    combined_flags.extend(config_flags.split_whitespace());
 
     for key in &keys {
         match all_entries.get(*key) {
-            Some(entry) => combined_flags.extend(entry.flags.split_whitespace().map(String::from)),
+            Some(entry) => combined_flags.extend(entry.flags.split_whitespace()),
             None => eprintln!("[rlib] Warning: '{}' not found in list.json — skipping.", key),
         }
     }
@@ -648,11 +664,11 @@ fn cmd_build(args: Vec<String>) {
     }
 
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let rlib_base = PathBuf::from(&home).join("rlib");
+    let rlib_base = PathBuf::from(&home).join(".rlib");
     let gen_project = rlib_base.join("rlib_gen");
 
     fs::create_dir_all(&rlib_base).unwrap_or_else(|e| {
-        eprintln!("[rlib] Failed to create ~/rlib: {}", e);
+        eprintln!("[rlib] Failed to create ~/.rlib: {}", e);
         exit(1);
     });
 
@@ -719,7 +735,7 @@ fn cmd_build(args: Vec<String>) {
 
     Command::new("clear").status().ok();
     print!("\x1B[2J\x1B[1;1H");
-    println!("[rlib] Done. Saved '{}' to ~/rlib/list.json", folder_name);
+    println!("[rlib] Done. Saved '{}' to ~/.rlib/list.json", folder_name);
 }
 
 fn cmd_print_for_cargo(list_path: &str) {
@@ -738,7 +754,7 @@ fn cmd_print_for_cargo(list_path: &str) {
     }
 
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let list_json = PathBuf::from(&home).join("rlib").join("list.json");
+    let list_json = PathBuf::from(&home).join(".rlib").join("list.json");
     let all_entries = load_list(&list_json);
 
     Command::new("clear").status().ok();
