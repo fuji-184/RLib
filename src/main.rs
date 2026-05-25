@@ -219,15 +219,26 @@ fn main() {
         }
         
         "this" => {
-            if args.len() < 4 {
-                eprintln!("[rlib] Usage: rlib this add <key> | rlib this remove <key>");
+            if args.len() < 3 {
+                eprintln!("[rlib] Usage: rlib this [add|remove] <key>, rlib this print, rlib this print for cargo, or rlib this cargo <args>");
                 exit(1);
             }
             let sub_cmd = &args[2];
-            let key = &args[3];
             match sub_cmd.as_str() {
-                "add" => cmd_list_add("rlib.list", key),
-                "remove" => cmd_list_remove("rlib.list", key),
+                "add" => {
+                    if args.len() < 4 {
+                        eprintln!("[rlib] Usage: rlib this add <key>");
+                        exit(1);
+                    }
+                    cmd_list_add("rlib.list", &args[3]);
+                }
+                "remove" => {
+                    if args.len() < 4 {
+                        eprintln!("[rlib] Usage: rlib this remove <key>");
+                        exit(1);
+                    }
+                    cmd_list_remove("rlib.list", &args[3]);
+                }
                 "print" => {
                     if args.len() == 5 && args[3] == "for" && args[4] == "cargo" {
                         cmd_print_for_cargo("rlib.list");
@@ -237,7 +248,7 @@ fn main() {
                         eprintln!("[rlib] Unknown command. Did you mean 'rlib this print' or 'rlib this print for cargo'?");
                         exit(1);
                     }
-                },
+                }
                 _ => {
                     let mut run_args = vec![args[0].clone(), "rlib.list".to_string()];
                     run_args.extend(args[2..].iter().cloned());
