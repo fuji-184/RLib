@@ -340,9 +340,21 @@ MANAGING CURRENT DIRECTORY LIST
   rlib this remove <key>
       Remove <key> from 'rlib.list' in the current directory.
       
+  rlib this print
+      Print the active (non-comment) keys in 'rlib.list' in the current directory.
+      
   rlib this print for cargo
       Clear the terminal and print all libraries in 'rlib.list' as
       Cargo.toml [dependencies] entries ready to copy-paste.
+      
+  rlib this <cargo sub-command...> [nightly]
+      Shortcut to run cargo commands directly using 'rlib.list' in the
+      current directory.
+
+      Examples:
+        rlib this cargo run
+        rlib this cargo run nightly
+        rlib this cargo check
 
 MANAGING A SPECIFIC .list FILE
   rlib <rlib.list> add <key>
