@@ -231,8 +231,10 @@ fn main() {
                 "print" => {
                     if args.len() == 5 && args[3] == "for" && args[4] == "cargo" {
                         cmd_print_for_cargo("rlib.list");
+                    } else if args.len() == 3 {
+                        cmd_list_file("rlib.list");
                     } else {
-                        eprintln!("[rlib] Unknown command. Did you mean 'rlib this print for cargo'?");
+                        eprintln!("[rlib] Unknown command. Did you mean 'rlib this print' or 'rlib this print for cargo'?");
                         exit(1);
                     }
                 },
