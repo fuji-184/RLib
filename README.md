@@ -39,7 +39,7 @@ While tools like `sccache` (Mozilla's compiler cache) solve a similar problem, R
 ## Installation
 
 ```bash
-cargo install rlib
+cargo install --git https://github.com/fuji-184/RLib
 ```
 
 ---
