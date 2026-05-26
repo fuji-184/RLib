@@ -307,7 +307,7 @@ RUNNING CARGO WITH RLIB FLAGS
   rlib <rlib.list> <cargo sub-command...> [nightly]
       Read library keys from <rlib.list> (one per line), look them
       up in ~/.rlib/list.json, combine their rustc flags plus the
-      settings from rlib.config in the current directory, inject them
+      settings from rlib.config in the current directory, pass them
       as RUSTFLAGS, then execute the cargo command.
       Lines starting with # are treated as comments and ignored.
       Append 'nightly' to enable nightly-only flags (-Z flags, cranelift).
@@ -629,7 +629,7 @@ fn cmd_run(args: Vec<String>) {
         exit(1);
     }
 
-    println!("[rlib] Injecting RUSTFLAGS for: {}", keys.join(", "));
+    println!("[rlib] Passing RUSTFLAGS for: {}", keys.join(", "));
     println!(
         "[rlib] Backend: {}, Linker: {}, Allocator: {}, Channel: {}",
         cfg.backend,

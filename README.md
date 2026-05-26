@@ -30,9 +30,17 @@ While tools like `sccache` (Mozilla's compiler cache) solve a similar problem, R
 
 | Feature | RLib | sccache |
 | --- | --- | --- |
-| **Overhead** | **Zero Overhead.** Direct path pass via compiler flags. | **Compression Overhead.** Incurs time costs compressing and decompressing cache artifacts. |
+| **Overhead** | **Zero Overhead.** Direct path pass via compiler flags. Serverless, runs instantly as a direct CLI tool | **Compression and Client-Server Overhead.** Incurs time costs compressing and decompressing cache artifacts. Using Client-Server Model that requires background daemon process, introducing communication overhead over networking while the background server consumes resources |
 | **Granularity** | **Fine-Grained Management.** Explicit control over which library versions and exact features are active or removed. | **Implicit Caching.** Automatic global matching based on hashes, hard to inspect or manually prune specific libraries. |
 | **Storage Security** | Completely immune to local `cargo clean`. | Immune to local `cargo clean` but vulnerable to automatic cache size evictions. |
+
+---
+
+## Installation
+
+```bash
+cargo install rlib
+```
 
 ---
 

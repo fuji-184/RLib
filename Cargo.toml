@@ -2,6 +2,14 @@
 name = "rlib"
 version = "0.1.0"
 edition = "2024"
+authors = ["Fuji"]
+description = "A lightweight, zero-overhead development tool for Rust that precompiles crates and shares them dynamically across all local projects"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["precompiled-crate-manager", "build-cache", "compile-speed"]
+categories = ["development-tools", "development-tools::cargo-plugins", "command-line-utilities"]
+repository = "https://github.com/fuji-184/RLib"
+homepage = "https://github.com/fuji-184/RLib"
 
 [dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
