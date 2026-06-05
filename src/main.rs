@@ -8,6 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 use serde::{Serialize, Deserialize};
+use std::fs::{File, write};
+use std::io::{BufRead, BufReader};
+use std::process::Stdio;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const BASE_FLAGS_STABLE: &str = concat!(
     "-C debuginfo=0 ",
@@ -45,6 +49,9 @@ const BASE_FLAGS_NIGHTLY: &str = concat!(
 
 const LLVM_FLAGS: &str = "-Cno-prepopulate-passes";
 const CRANELIFT_FLAGS: &str = "-Zcodegen-backend=cranelift";
+
+// f_comptime
+const CACHE_FILE: &str = "target/.comptime_last_test";
 
 struct RlibConfig {
     backend: String,
@@ -223,6 +230,14 @@ fn main() {
                 eprintln!("[rlib] Usage: rlib this [add|remove] <key>, rlib this print, rlib this print for cargo, or rlib this cargo <args>");
                 exit(1);
             }
+            
+            if args[2] == "comptime" {
+                let mut fake_args = vec![args[0].clone(), "rlib.list".to_string()];
+                fake_args.extend(args[3..].iter().cloned());
+                handle_comptime_subcommand(&fake_args, "rlib.list");
+                exit(0);
+            }
+            
             let sub_cmd = &args[2];
             match sub_cmd.as_str() {
                 "add" => {
@@ -272,6 +287,13 @@ fn main() {
                 || Path::new(first).is_file();
 
             if looks_like_list {
+                if args.len() >= 3 && args[2] == "comptime" {
+                    let mut fake_args = vec![args[0].clone(), first.to_string()];
+                    fake_args.extend(args[3..].iter().cloned());
+                    handle_comptime_subcommand(&fake_args, first);
+                    exit(0);
+                }
+                
                 if args.len() >= 4 && args[2] == "add" {
                     cmd_list_add(first, &args[3]);
                 } else if args.len() >= 4 && args[2] == "remove" {
@@ -678,6 +700,10 @@ fn cmd_run(args: Vec<String>) {
 fn cmd_build(args: Vec<String>) {
     let lib_name = &args[1];
     let mut features: Vec<String> = Vec::new();
+    let mut git_url: Option<String> = None;
+    let mut git_branch: Option<String> = None;
+    let mut git_tag: Option<String> = None;
+    let mut git_rev: Option<String> = None;
 
     for arg in &args[2..] {
         if let Some(feat_str) = arg.strip_prefix("features=") {
@@ -686,6 +712,14 @@ fn cmd_build(args: Vec<String>) {
                 .map(|f| f.trim().to_string())
                 .filter(|f| !f.is_empty())
                 .collect();
+        } else if let Some(url) = arg.strip_prefix("git=") {
+            git_url = Some(url.to_string());
+        } else if let Some(branch) = arg.strip_prefix("branch=") {
+            git_branch = Some(branch.to_string());
+        } else if let Some(tag) = arg.strip_prefix("tag=") {
+            git_tag = Some(tag.to_string());
+        } else if let Some(rev) = arg.strip_prefix("rev=") {
+            git_rev = Some(rev.to_string());
         }
     }
 
@@ -715,12 +749,34 @@ fn cmd_build(args: Vec<String>) {
         });
     }
 
-    println!("[rlib] Adding dependency: {} {:?}", lib_name, features);
-    let mut cargo_add_args = vec!["add".to_string(), lib_name.clone()];
+    let mut cargo_add_args = vec!["add".to_string()];
+    
+    if let Some(url) = git_url {
+        cargo_add_args.push("--git".to_string());
+        cargo_add_args.push(url);
+        
+        if let Some(branch) = git_branch {
+            cargo_add_args.push("--branch".to_string());
+            cargo_add_args.push(branch);
+        } else if let Some(tag) = git_tag {
+            cargo_add_args.push("--tag".to_string());
+            cargo_add_args.push(tag);
+        } else if let Some(rev) = git_rev {
+            cargo_add_args.push("--rev".to_string());
+            cargo_add_args.push(rev);
+        }
+        
+        cargo_add_args.push(lib_name.clone());
+    } else {
+        cargo_add_args.push(lib_name.clone());
+    }
+
     if !features.is_empty() {
         cargo_add_args.push("--features".to_string());
         cargo_add_args.push(features.join(","));
     }
+
+    println!("[rlib] Adding dependency via cargo...");
     run_command(
         "cargo",
         &cargo_add_args.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -734,11 +790,12 @@ fn cmd_build(args: Vec<String>) {
     let version = get_lib_version(&gen_project, lib_name);
     let version_safe = version.replace('.', "_");
     let features_safe = features.join("_");
-    let folder_name = if features_safe.is_empty() {
-        format!("{}_{}", lib_name.replace('-', "_"), version_safe)
-    } else {
-        format!("{}_{}_{}", lib_name.replace('-', "_"), version_safe, features_safe)
-    };
+    
+    let mut folder_name = format!("{}_{}", lib_name.replace('-', "_"), version_safe);
+    if !features_safe.is_empty() {
+        folder_name.push('_');
+        folder_name.push_str(&features_safe);
+    }
 
     let output_dir = rlib_base.join(&folder_name);
     fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
@@ -948,4 +1005,490 @@ fn extract_crate_name(fname: &str) -> Option<String> {
     } else {
         Some(without_ext.to_string())
     }
+}
+
+// f_comptime start
+
+fn latest_src_mtime() -> u64 {
+    let mut latest = 0u64;
+    let mut stack = vec!["src".to_string()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&current) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path.to_string_lossy().to_string());
+            } else if path.extension().map_or(false, |e| e == "rs") {
+                if let Ok(meta) = fs::metadata(&path) {
+                    if let Ok(mtime) = meta.modified() {
+                        let secs = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                        if secs > latest {
+                            latest = secs;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    latest
+}
+
+fn last_test_timestamp() -> u64 {
+    fs::read_to_string(CACHE_FILE)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn save_test_timestamp() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = fs::create_dir_all("target");
+    let _ = fs::write(CACHE_FILE, now.to_string());
+}
+
+fn needs_retest() -> bool {
+    if latest_src_mtime() > last_test_timestamp() {
+        return true;
+    }
+    !comptime_files_exist()
+}
+
+fn comptime_files_exist() -> bool {
+    Path::new("comptime").exists()
+        && fs::read_dir("comptime")
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+}
+
+fn run_cargo_test() {
+    let output = Command::new("cargo")
+        .args(&["test", "--features=comptime", "--no-run", "--message-format=json", "--profile=dev", "--", "--no-capture"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .expect("Failed to compile tests");
+
+    if !output.status.success() {
+        let _ = Command::new("cargo")
+            .args(&["test", "--features=comptime", "--no-run", "--profile=dev", "--", "--no-capture"])
+            .status();
+        exit(1);
+    }
+
+    let mut test_binary = None;
+    let reader = BufReader::new(&output.stdout[..]);
+    for line_res in reader.lines() {
+        if let Ok(line) = line_res {
+            if line.starts_with('{') {
+                if let Some(start_idx) = line.find("\"executable\":\"") {
+                    let rem = &line[start_idx + 14..];
+                    if let Some(end_idx) = rem.find('"') {
+                        let path_str = &rem[..end_idx];
+                        if !path_str.is_empty() {
+                            test_binary = Some(path_str.replace("\\\\", "\\"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let Some(bin_path) = test_binary else {
+        let _ = Command::new("cargo")
+            .args(&["test", "--features=comptime", "--no-run"])
+            .status();
+        exit(1);
+    };
+
+    loop {
+        let run_output = Command::new(&bin_path)
+            .output()
+            .expect("Failed to execute test binary");
+
+        if run_output.status.success() {
+            break;
+        }
+
+        let stderr_str = String::from_utf8_lossy(&run_output.stderr);
+        let stdout_str = String::from_utf8_lossy(&run_output.stdout);
+
+        if stdout_str.contains("comptime error: output not found yet")
+            || stderr_str.contains("comptime error: output not found yet")
+            || stdout_str.contains("ParseIntError")
+            || stderr_str.contains("ParseIntError")
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        }
+
+        eprint!("{}", stdout_str);
+        eprint!("{}", stderr_str);
+        exit(1);
+    }
+
+    save_test_timestamp();
+}
+
+fn run_cargo_test_nested_raw() {
+    let output = Command::new("cargo")
+        .args(&["test", "--features=comptime", "--no-run", "--message-format=json", "--profile=dev", "--", "--no-capture"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .expect("Failed to compile tests");
+
+    if !output.status.success() {
+        let _ = Command::new("cargo")
+            .args(&["test", "--features=comptime", "--no-run", "--profile=dev", "--", "--no-capture"])
+            .status();
+        exit(1);
+    }
+
+    let mut test_binary = None;
+    let reader = BufReader::new(&output.stdout[..]);
+    for line_res in reader.lines() {
+        if let Ok(line) = line_res {
+            if line.starts_with('{') {
+                if let Some(start_idx) = line.find("\"executable\":\"") {
+                    let rem = &line[start_idx + 14..];
+                    if let Some(end_idx) = rem.find('"') {
+                        let path_str = &rem[..end_idx];
+                        if !path_str.is_empty() {
+                            test_binary = Some(path_str.replace("\\\\", "\\"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let Some(bin_path) = test_binary else {
+        let _ = Command::new("cargo")
+            .args(&["test", "--features=comptime", "--no-run"])
+            .status();
+        exit(1);
+    };
+
+    loop {
+        let run_output = Command::new(&bin_path)
+            .output()
+            .expect("Failed to execute test binary");
+
+        let stderr_str = String::from_utf8_lossy(&run_output.stderr);
+        let stdout_str = String::from_utf8_lossy(&run_output.stdout);
+
+        if stdout_str.contains("comptime error: raw output not found yet")
+            || stderr_str.contains("comptime error: raw output not found yet")
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    let output = Command::new("cargo")
+        .env("RUSTFLAGS", "--cfg comptime_ready")
+        .args(&["test", "--features=comptime", "--no-run", "--message-format=json", "--profile=dev", "--", "--no-capture"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .expect("Failed to compile tests");
+
+    if !output.status.success() {
+        let _ = Command::new("cargo")
+            .env("RUSTFLAGS", "--cfg comptime_ready")
+            .args(&["test", "--features=comptime", "--no-run", "--profile=dev", "--", "--no-capture"])
+            .status();
+        exit(1);
+    }
+
+    let mut test_binary = None;
+    let reader = BufReader::new(&output.stdout[..]);
+    for line_res in reader.lines() {
+        if let Ok(line) = line_res {
+            if line.starts_with('{') {
+                if let Some(start_idx) = line.find("\"executable\":\"") {
+                    let rem = &line[start_idx + 14..];
+                    if let Some(end_idx) = rem.find('"') {
+                        let path_str = &rem[..end_idx];
+                        if !path_str.is_empty() {
+                            test_binary = Some(path_str.replace("\\\\", "\\"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let Some(bin_path) = test_binary else {
+        let _ = Command::new("cargo")
+            .env("RUSTFLAGS", "--cfg comptime_ready")
+            .args(&["test", "--features=comptime", "--no-run"])
+            .status();
+        exit(1);
+    };
+
+    loop {
+        let run_output = Command::new(&bin_path)
+            .output()
+            .expect("Failed to execute test binary");
+
+        let stderr_str = String::from_utf8_lossy(&run_output.stderr);
+        let stdout_str = String::from_utf8_lossy(&run_output.stdout);
+
+        if stdout_str.contains("comptime error: output not found yet")
+            || stderr_str.contains("comptime error: output not found yet")
+            || stdout_str.contains("comptime error: raw output not found yet")
+            || stderr_str.contains("comptime error: raw output not found yet")
+            || stdout_str.contains("ParseIntError")
+            || stderr_str.contains("ParseIntError")
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    save_test_timestamp();
+}
+
+fn handle_custom_comptime(file_path: &str) {
+    let path = Path::new(file_path);
+    if !path.exists() {
+        eprintln!("Error: Configuration file '{}' not found.", file_path);
+        exit(1);
+    }
+    let file = File::open(path).expect("Failed to open configuration file");
+    let reader = BufReader::new(file);
+    for line_result in reader.lines() {
+        let line = line_result.expect("Failed to read line");
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let status = Command::new(parts[0]).args(&parts[1..]).status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => exit(s.code().unwrap_or(1)),
+            Err(_) => {
+                eprintln!("Failed to run command: {}", trimmed);
+                exit(1);
+            }
+        }
+    }
+}
+
+fn handle_comptime_subcommand(args: &[String], list_path: &str) {
+    if args.len() < 3 {
+        print_help();
+        exit(1);
+    }
+    
+    let arg2 = args[2].as_str();
+    if arg2 == "-h" || arg2 == "--help" {
+        print_help();
+        exit(0);
+    }
+    let nightly = args.iter().any(|a| a == "nightly");
+    let use_cargo_backend = args.iter().any(|a| a == "cargo");
+    if arg2 == "init" {
+        if args.len() >= 4 && args[3] == "config" {
+            let template = "# Add your custom commands below\ncargo build --release\n";
+            let _ = write("comptime.config", template);
+            exit(0);
+        } else {
+            exit(1);
+        }
+    }
+    match arg2 {
+        "check" | "run" | "build" if args.len() >= 5 && args[3] == "nested" && args[4] == "raw" => {
+            if needs_retest() {
+                if use_cargo_backend {        run_cargo_test_nested_raw();
+                } else {                    run_rustc_comptime_nested_raw(list_path, nightly);
+                }
+            }
+            let remaining: Vec<&str> = args.iter().skip(5).filter(|&a| a != "nightly").map(|s| s.as_str()).collect();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+            let mut cmd = Command::new("cargo");
+            cmd.env("COMPTIME_NONCE", now.to_string()).arg(arg2).args(&remaining);
+            let status = cmd.status();
+            std::process::exit(status.map(|s| s.code().unwrap_or(1)).unwrap_or(1));
+        }
+        "check" | "run" | "build" => {
+            if needs_retest() {
+                if use_cargo_backend {
+                    run_cargo_test();
+                } else {
+                    run_rustc_comptime(list_path, nightly);
+                }
+            }
+            let remaining: Vec<&str> = args.iter().skip(3).filter(|&a| a != "nightly").map(|s| s.as_str()).collect();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+            let mut cmd = Command::new("cargo");
+            cmd.env("COMPTIME_NONCE", now.to_string()).arg(arg2).args(&remaining);
+            let status = cmd.status();
+            std::process::exit(status.map(|s| s.code().unwrap_or(1)).unwrap_or(1));
+        }
+        _ => {
+            if needs_retest() {
+                run_cargo_test();
+            }
+            handle_custom_comptime(arg2);
+        }
+    }
+}
+
+fn get_rlib_rustc_base_args(list_path: &str, nightly: bool) -> Vec<String> {
+    let list_content = std::fs::read_to_string(list_path).unwrap_or_default();
+    let keys = active_lines(&list_content);
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let list_json = PathBuf::from(&home).join(".rlib").join("list.json");
+    let all_entries = load_list(&list_json);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut cfg = load_rlib_config(&cwd);
+    cfg.nightly = nightly;
+
+    if !nightly && cfg.backend == "cranelift" {
+        cfg.backend = "llvm".to_string();
+    }
+
+    let mut flags_builder = Vec::new();
+    let config_flags = build_config_flags(&cfg);
+    flags_builder.extend(config_flags.split_whitespace().map(|s| s.to_string()));
+
+    for key in &keys {
+        if let Some(entry) = all_entries.get(*key) {
+            flags_builder.extend(entry.flags.split_whitespace().map(|s| s.to_string()));
+        }
+    }
+
+    flags_builder
+}
+
+fn run_rustc_comptime(list_path: &str, nightly: bool) {
+    let mut rustc_args = get_rlib_rustc_base_args(list_path, nightly);
+    
+    let test_src = if Path::new("src/lib.rs").exists() { "src/lib.rs" } else { "src/main.rs" };
+    let out_exe = if cfg!(windows) { "target/debug/deps/comptime_test.exe" } else { "target/debug/deps/comptime_test" };
+    
+    let _ = std::fs::create_dir_all("target/debug/deps");
+
+    let mut args = vec![
+        test_src.to_string(),
+        "--test".to_string(),
+        "-C".to_string(), "debuginfo=2".to_string(),
+        "--cfg".to_string(), "feature=\"comptime\"".to_string(),
+        "-o".to_string(), out_exe.to_string(),
+    ];
+    args.extend(rustc_args);
+
+    let status = Command::new("rustc")
+        .args(&args)
+        .status()
+        .expect("Failed to compile comptime with rustc");
+
+    if !status.success() {
+        std::process::exit(1);
+    }
+
+    loop {
+        let run_output = Command::new(out_exe)
+            .output()
+            .expect("Failed to execute test binary");
+
+        if run_output.status.success() {
+            break;
+        }
+
+        let stderr_str = String::from_utf8_lossy(&run_output.stderr);
+        let stdout_str = String::from_utf8_lossy(&run_output.stdout);
+
+        if stdout_str.contains("comptime error: output not found yet")
+            || stderr_str.contains("comptime error: output not found yet")
+            || stdout_str.contains("ParseIntError")
+            || stderr_str.contains("ParseIntError")
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        }
+
+        std::io::Write::write_all(&mut std::io::stderr(), run_output.stdout.as_slice()).unwrap();
+        std::io::Write::write_all(&mut std::io::stderr(), run_output.stderr.as_slice()).unwrap();
+        std::process::exit(1);
+    }
+    save_test_timestamp();
+}
+
+fn run_rustc_comptime_nested_raw(list_path: &str, nightly: bool) {
+    let rlib_flags = get_rlib_rustc_base_args(list_path, nightly);
+    let test_src = if Path::new("src/lib.rs").exists() { "src/lib.rs" } else { "src/main.rs" };
+    let out_exe = if cfg!(windows) { "target/debug/deps/comptime_test.exe" } else { "target/debug/deps/comptime_test" };
+    let _ = std::fs::create_dir_all("target/debug/deps");
+
+    let mut args = vec![
+        test_src.to_string(),
+        "--test".to_string(),
+        "-C".to_string(), "debuginfo=2".to_string(),
+        "--cfg".to_string(), "feature=\"comptime\"".to_string(),
+        "-o".to_string(), out_exe.to_string(),
+    ];
+    args.extend(rlib_flags.clone());
+
+    let status = Command::new("rustc").args(&args).status().expect("Failed to compile raw binary");
+    if !status.success() { std::process::exit(1); }
+
+    loop {
+        let run_output = Command::new(out_exe).output().expect("Failed to execute raw test binary");
+        let stderr_str = String::from_utf8_lossy(&run_output.stderr);
+        let stdout_str = String::from_utf8_lossy(&run_output.stdout);
+
+        if stdout_str.contains("comptime error: raw output not found yet")
+            || stderr_str.contains("comptime error: raw output not found yet")
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        }
+        break;
+    }
+
+    let mut ready_args = vec![
+        test_src.to_string(),
+        "--test".to_string(),
+        "-C".to_string(), "debuginfo=2".to_string(),
+        "--cfg".to_string(), "feature=\"comptime\"".to_string(),
+        "--cfg".to_string(), "comptime_ready".to_string(),
+        "-o".to_string(), out_exe.to_string(),
+    ];
+    ready_args.extend(rlib_flags);
+
+    let status = Command::new("rustc").args(&ready_args).status().expect("Failed to compile ready binary");
+    if !status.success() { std::process::exit(1); }
+
+    loop {
+        let run_output = Command::new(out_exe).output().expect("Failed to execute ready test binary");
+        let stderr_str = String::from_utf8_lossy(&run_output.stderr);
+        let stdout_str = String::from_utf8_lossy(&run_output.stdout);
+
+        if stdout_str.contains("comptime error: output not found yet")
+            || stderr_str.contains("comptime error: output not found yet")
+            || stdout_str.contains("comptime error: raw output not found yet")
+            || stderr_str.contains("comptime error: raw output not found yet")
+            || stdout_str.contains("ParseIntError")
+            || stderr_str.contains("ParseIntError")
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        }
+        break;
+    }
+    save_test_timestamp();
 }
