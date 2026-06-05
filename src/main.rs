@@ -1309,17 +1309,27 @@ fn handle_comptime_subcommand(args: &[String], list_path: &str) {
             exit(1);
         }
     }
+
+    let rlib_flags = get_rlib_rustc_base_args(list_path);
+    let rustflags_str = rlib_flags.join(" ");
+
     match arg2 {
         "check" | "run" | "build" if args.len() >= 5 && args[3] == "nested" && args[4] == "raw" => {
             if needs_retest() {
-                if use_cargo_backend {        run_cargo_test_nested_raw();
-                } else {                    run_rustc_comptime_nested_raw(list_path, nightly);
+                if use_cargo_backend {
+                    run_cargo_test_nested_raw();
+                } else {
+                    run_rustc_comptime_nested_raw(list_path, nightly);
                 }
             }
-            let remaining: Vec<&str> = args.iter().skip(5).filter(|&a| a != "nightly").map(|s| s.as_str()).collect();
+            let remaining: Vec<&str> = args.iter().skip(5).filter(|&a| a != "nightly" && a != "cargo").map(|s| s.as_str()).collect();
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
             let mut cmd = Command::new("cargo");
-            cmd.env("COMPTIME_NONCE", now.to_string()).arg(arg2).args(&remaining);
+            cmd.env("COMPTIME_NONCE", now.to_string())
+               .env("RUSTFLAGS", &rustflags_str)
+               .env("CARGO_PROFILE_DEV_BUILD_OVERRIDE_OPT_LEVEL", "3")
+               .arg(arg2)
+               .args(&remaining);
             let status = cmd.status();
             std::process::exit(status.map(|s| s.code().unwrap_or(1)).unwrap_or(1));
         }
@@ -1331,10 +1341,14 @@ fn handle_comptime_subcommand(args: &[String], list_path: &str) {
                     run_rustc_comptime(list_path, nightly);
                 }
             }
-            let remaining: Vec<&str> = args.iter().skip(3).filter(|&a| a != "nightly").map(|s| s.as_str()).collect();
+            let remaining: Vec<&str> = args.iter().skip(3).filter(|&a| a != "nightly" && a != "cargo").map(|s| s.as_str()).collect();
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
             let mut cmd = Command::new("cargo");
-            cmd.env("COMPTIME_NONCE", now.to_string()).arg(arg2).args(&remaining);
+            cmd.env("COMPTIME_NONCE", now.to_string())
+               .env("RUSTFLAGS", &rustflags_str)
+               .env("CARGO_PROFILE_DEV_BUILD_OVERRIDE_OPT_LEVEL", "3")
+               .arg(arg2)
+               .args(&remaining);
             let status = cmd.status();
             std::process::exit(status.map(|s| s.code().unwrap_or(1)).unwrap_or(1));
         }
@@ -1347,35 +1361,35 @@ fn handle_comptime_subcommand(args: &[String], list_path: &str) {
     }
 }
 
-fn get_rlib_rustc_base_args(list_path: &str, nightly: bool) -> Vec<String> {
-    let list_content = std::fs::read_to_string(list_path).unwrap_or_default();
-    let keys = active_lines(&list_content);
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+fn get_rlib_rustc_base_args(list_path: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let content = match fs::read_to_string(list_path) {
+        Ok(c) => c,
+        Err(_) => return args,
+    };
+
+    let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let list_json = PathBuf::from(&home).join(".rlib").join("list.json");
     let all_entries = load_list(&list_json);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut cfg = load_rlib_config(&cwd);
-    cfg.nightly = nightly;
 
-    if !nightly && cfg.backend == "cranelift" {
-        cfg.backend = "llvm".to_string();
-    }
-
-    let mut flags_builder = Vec::new();
-    let config_flags = build_config_flags(&cfg);
-    flags_builder.extend(config_flags.split_whitespace().map(|s| s.to_string()));
-
-    for key in &keys {
-        if let Some(entry) = all_entries.get(*key) {
-            flags_builder.extend(entry.flags.split_whitespace().map(|s| s.to_string()));
+    for line in content.lines() {
+        let key = line.trim();
+        if key.is_empty() || key.starts_with('#') {
+            continue;
+        }
+        if let Some(entry) = all_entries.get(key) {
+            for flag in entry.flags.split_whitespace() {
+                if !flag.is_empty() {
+                    args.push(flag.to_string());
+                }
+            }
         }
     }
-
-    flags_builder
+    args
 }
 
 fn run_rustc_comptime(list_path: &str, nightly: bool) {
-    let mut rustc_args = get_rlib_rustc_base_args(list_path, nightly);
+    let mut rustc_args = get_rlib_rustc_base_args(list_path);
     
     let test_src = if Path::new("src/lib.rs").exists() { "src/lib.rs" } else { "src/main.rs" };
     let out_exe = if cfg!(windows) { "target/debug/deps/comptime_test.exe" } else { "target/debug/deps/comptime_test" };
@@ -1385,7 +1399,6 @@ fn run_rustc_comptime(list_path: &str, nightly: bool) {
     let mut args = vec![
         test_src.to_string(),
         "--test".to_string(),
-        "-C".to_string(), "debuginfo=2".to_string(),
         "--cfg".to_string(), "feature=\"comptime\"".to_string(),
         "-o".to_string(), out_exe.to_string(),
     ];
@@ -1399,15 +1412,19 @@ fn run_rustc_comptime(list_path: &str, nightly: bool) {
     if !status.success() {
         std::process::exit(1);
     }
+    
+    let rustc_sysroot = Command::new("rustc")
+        .args(&["--print", "sysroot"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let rust_lib_path = format!("{}/lib", rustc_sysroot);
 
     loop {
         let run_output = Command::new(out_exe)
+            .env("LD_LIBRARY_PATH", &rust_lib_path)
             .output()
             .expect("Failed to execute test binary");
-
-        if run_output.status.success() {
-            break;
-        }
 
         let stderr_str = String::from_utf8_lossy(&run_output.stderr);
         let stdout_str = String::from_utf8_lossy(&run_output.stdout);
@@ -1419,6 +1436,8 @@ fn run_rustc_comptime(list_path: &str, nightly: bool) {
         {
             std::thread::sleep(std::time::Duration::from_millis(1));
             continue;
+        } else {
+          break;
         }
 
         std::io::Write::write_all(&mut std::io::stderr(), run_output.stdout.as_slice()).unwrap();
@@ -1429,7 +1448,7 @@ fn run_rustc_comptime(list_path: &str, nightly: bool) {
 }
 
 fn run_rustc_comptime_nested_raw(list_path: &str, nightly: bool) {
-    let rlib_flags = get_rlib_rustc_base_args(list_path, nightly);
+    let rlib_flags = get_rlib_rustc_base_args(list_path);
     let test_src = if Path::new("src/lib.rs").exists() { "src/lib.rs" } else { "src/main.rs" };
     let out_exe = if cfg!(windows) { "target/debug/deps/comptime_test.exe" } else { "target/debug/deps/comptime_test" };
     let _ = std::fs::create_dir_all("target/debug/deps");
@@ -1437,7 +1456,6 @@ fn run_rustc_comptime_nested_raw(list_path: &str, nightly: bool) {
     let mut args = vec![
         test_src.to_string(),
         "--test".to_string(),
-        "-C".to_string(), "debuginfo=2".to_string(),
         "--cfg".to_string(), "feature=\"comptime\"".to_string(),
         "-o".to_string(), out_exe.to_string(),
     ];
@@ -1445,9 +1463,20 @@ fn run_rustc_comptime_nested_raw(list_path: &str, nightly: bool) {
 
     let status = Command::new("rustc").args(&args).status().expect("Failed to compile raw binary");
     if !status.success() { std::process::exit(1); }
+    
+    let rustc_sysroot = Command::new("rustc")
+        .args(&["--print", "sysroot"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let rust_lib_path = format!("{}/lib", rustc_sysroot);
 
     loop {
-        let run_output = Command::new(out_exe).output().expect("Failed to execute raw test binary");
+        let run_output = Command::new(out_exe)
+            .env("LD_LIBRARY_PATH", &rust_lib_path)
+            .output()
+            .expect("Failed to execute test binary");
+
         let stderr_str = String::from_utf8_lossy(&run_output.stderr);
         let stdout_str = String::from_utf8_lossy(&run_output.stdout);
 
@@ -1487,8 +1516,9 @@ fn run_rustc_comptime_nested_raw(list_path: &str, nightly: bool) {
         {
             std::thread::sleep(std::time::Duration::from_millis(1));
             continue;
+        } else {
+            break;
         }
-        break;
     }
     save_test_timestamp();
 }
