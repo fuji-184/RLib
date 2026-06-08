@@ -79,6 +79,11 @@ struct LibEntry {
     features: Vec<String>,
 }
 
+struct BuildTarget {
+    name: String,
+    features: Vec<String>,
+}
+
 fn load_rlib_config(cwd: &Path) -> RlibConfig {
     let path = cwd.join("rlib.config");
     let content = match fs::read_to_string(&path) {
@@ -324,7 +329,14 @@ BUILDING
         rlib tokio features=full
         rlib serde features=derive,std
         rlib anyhow
-
+        
+  rlib <lib_name_1> [features=...] <lib_name_2> [features=...] ...`
+      Builds multiple libraries as release .rlkb, copy all deps 5l ~/.rlib/<lib1>_<version>_<features>-<lib2>_<version>_<features>. It groups combination of libraries and prevents dependency conflict. For example, if an Axum rlib is compiled with Tokio version 1.5.2, while the user inputs that Axum rlib with Tokio rlib 1.5.3, the compiler will throw an error because Axum rlib looks for Tokio 1.5.2 but it is not available. By grouping them, it just needs to pass this rlib group to successfully use compatible Axum and Tokio rlibs.
+      
+      Examples:
+        rlib serde serde_json
+        rlib tokio features=full axum serde features=derive
+        
 RUNNING CARGO WITH RLIB FLAGS
   rlib <rlib.list> <cargo sub-command...> [nightly]
       Read library keys from <rlib.list> (one per line), look them
@@ -476,21 +488,60 @@ allocator=jemalloc
     println!("[rlib] Created rlib.config in the current directory.");
 }
 
+fn get_dir_size<P: AsRef<Path>>(path: P) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                total += get_dir_size(&p);
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.2} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
 fn cmd_list_json() {
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let list_json = PathBuf::from(&home).join(".rlib").join("list.json");
-    let map = load_list(&list_json);
-
-    if map.is_empty() {
-        println!("[rlib] list.json is empty or does not exist.");
-        return;
-    }
-
-    let mut keys: Vec<&String> = map.keys().collect();
+    let rlib_base = PathBuf::from(&home).join(".rlib");
+    let list_json = rlib_base.join("list.json");
+    let all_entries = load_list(&list_json);
+    
+    let mut keys: Vec<&String> = all_entries.keys().collect();
     keys.sort();
-    println!("[rlib] Entries in ~/.rlib/list.json ({}):", keys.len());
-    for k in keys {
-        println!("  {}", k);
+    
+    let mut grand_total = 0u64;
+    let mut sizes = Vec::new();
+    
+    for &key in &keys {
+        let folder_path = rlib_base.join(key);
+        let size = if folder_path.exists() {
+            get_dir_size(&folder_path)
+        } else {
+            0
+        };
+        grand_total += size;
+        sizes.push(size);
+    }
+    
+    println!("[rlib] Entries in ~/.rlib/list.json ({} -> {}):", all_entries.len(), format_size(grand_total));
+    
+    for (i, key) in keys.into_iter().enumerate() {
+        println!("  {}\n    {}", key, format_size(sizes[i]));
     }
 }
 
@@ -698,29 +749,45 @@ fn cmd_run(args: Vec<String>) {
 }
 
 fn cmd_build(args: Vec<String>) {
-    let lib_name = &args[1];
-    let mut features: Vec<String> = Vec::new();
-    let mut git_url: Option<String> = None;
-    let mut git_branch: Option<String> = None;
-    let mut git_tag: Option<String> = None;
-    let mut git_rev: Option<String> = None;
+    if args.len() < 2 {
+        eprintln!("[rlib] Usage: rlib <lib1> [features=...] <lib2> [features=...]");
+        exit(1);
+    }
 
-    for arg in &args[2..] {
+    let mut targets: Vec<BuildTarget> = Vec::new();
+    let mut current_target: Option<BuildTarget> = None;
+
+    for arg in args.into_iter().skip(1) {
         if let Some(feat_str) = arg.strip_prefix("features=") {
-            features = feat_str
-                .split(',')
-                .map(|f| f.trim().to_string())
-                .filter(|f| !f.is_empty())
-                .collect();
-        } else if let Some(url) = arg.strip_prefix("git=") {
-            git_url = Some(url.to_string());
-        } else if let Some(branch) = arg.strip_prefix("branch=") {
-            git_branch = Some(branch.to_string());
-        } else if let Some(tag) = arg.strip_prefix("tag=") {
-            git_tag = Some(tag.to_string());
-        } else if let Some(rev) = arg.strip_prefix("rev=") {
-            git_rev = Some(rev.to_string());
+            if let Some(ref mut target) = current_target {
+                target.features = feat_str
+                    .split(',')
+                    .map(|f| f.trim().to_string())
+                    .filter(|f| !f.is_empty())
+                    .collect();
+            } else {
+                eprintln!("[rlib] Error: features specified before library name.");
+                exit(1);
+            }
+        } else if arg.contains('=') {
+            continue;
+        } else {
+            if let Some(target) = current_target.take() {
+                targets.push(target);
+            }
+            current_target = Some(BuildTarget {
+                name: arg,
+                features: Vec::new(),
+            });
         }
+    }
+    if let Some(target) = current_target {
+        targets.push(target);
+    }
+
+    if targets.is_empty() {
+        eprintln!("[rlib] Error: No libraries specified specified for building.");
+        exit(1);
     }
 
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
@@ -743,60 +810,47 @@ fn cmd_build(args: Vec<String>) {
     let target_dir = gen_project.join("target");
     if target_dir.exists() {
         println!("[rlib] Removing target directory...");
-        fs::remove_dir_all(&target_dir).unwrap_or_else(|e| {
-            eprintln!("[rlib] Failed to remove target directory: {}", e);
-            exit(1);
-        });
+        let _ = fs::remove_dir_all(&target_dir);
     }
 
-    let mut cargo_add_args = vec!["add".to_string()];
-    
-    if let Some(url) = git_url {
-        cargo_add_args.push("--git".to_string());
-        cargo_add_args.push(url);
-        
-        if let Some(branch) = git_branch {
-            cargo_add_args.push("--branch".to_string());
-            cargo_add_args.push(branch);
-        } else if let Some(tag) = git_tag {
-            cargo_add_args.push("--tag".to_string());
-            cargo_add_args.push(tag);
-        } else if let Some(rev) = git_rev {
-            cargo_add_args.push("--rev".to_string());
-            cargo_add_args.push(rev);
+    for target in &targets {
+        let mut cargo_add_args = vec!["add".to_string(), target.name.clone()];
+        if !target.features.is_empty() {
+            cargo_add_args.push("--features".to_string());
+            cargo_add_args.push(target.features.join(","));
         }
-        
-        cargo_add_args.push(lib_name.clone());
-    } else {
-        cargo_add_args.push(lib_name.clone());
+        println!("[rlib] Adding dependency via cargo: {}", target.name);
+        run_command(
+            "cargo",
+            &cargo_add_args.iter().map(String::as_str).collect::<Vec<_>>(),
+            &gen_project,
+            "cargo add",
+        );
     }
-
-    if !features.is_empty() {
-        cargo_add_args.push("--features".to_string());
-        cargo_add_args.push(features.join(","));
-    }
-
-    println!("[rlib] Adding dependency via cargo...");
-    run_command(
-        "cargo",
-        &cargo_add_args.iter().map(String::as_str).collect::<Vec<_>>(),
-        &gen_project,
-        "cargo add",
-    );
 
     println!("[rlib] Building release...");
     run_command("cargo", &["build", "--release"], &gen_project, "cargo build --release");
 
-    let version = get_lib_version(&gen_project, lib_name);
-    let version_safe = version.replace('.', "_");
-    let features_safe = features.join("_");
-    
-    let mut folder_name = format!("{}_{}", lib_name.replace('-', "_"), version_safe);
-    if !features_safe.is_empty() {
-        folder_name.push('_');
-        folder_name.push_str(&features_safe);
+    let mut folder_parts: Vec<String> = Vec::new();
+    let mut combined_names: Vec<String> = Vec::new();
+    let mut combined_features: Vec<String> = Vec::new();
+
+    for target in &targets {
+        let version = get_lib_version(&gen_project, &target.name);
+        let version_safe = version.replace('.', "_");
+        let features_safe = target.features.join("_");
+
+        let mut part = format!("{}_{}", target.name.replace('-', "_"), version_safe);
+        if !features_safe.is_empty() {
+            part.push('_');
+            part.push_str(&features_safe);
+        }
+        folder_parts.push(part);
+        combined_names.push(target.name.clone());
+        combined_features.extend(target.features.clone());
     }
 
+    let folder_name = folder_parts.join("-");
     let output_dir = rlib_base.join(&folder_name);
     fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
         eprintln!("[rlib] Failed to create output directory: {}", e);
@@ -809,14 +863,15 @@ fn cmd_build(args: Vec<String>) {
 
     let flags = build_flags(&output_dir);
     let list_json = rlib_base.join("list.json");
+    
     save_to_list(&list_json, &folder_name, LibEntry {
         flags,
-        name: lib_name.to_string(),
-        version,
-        features,
+        name: combined_names.join(", "),
+        version: "multi".to_string(),
+        features: combined_features,
     });
 
-    Command::new("clear").status().ok();
+    let _ = Command::new("clear").status();
     print!("\x1B[2J\x1B[1;1H");
     println!("[rlib] Done. Saved '{}' to ~/.rlib/list.json", folder_name);
 }

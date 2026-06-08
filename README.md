@@ -72,6 +72,8 @@ A wrapper shortcut that executes any Cargo command (e.g., `check`, `run`, `build
 
 * `rlib <lib_name> [features=a,b,c]`
 Compiles `<lib_name>` with specified features as a standalone release binary, moves it to the global storage, and updates the index.
+* `rlib <lib_name_1> [features=...] <lib_name_2> [features=...] ...`
+**[Multi-Library Build]** Compiles multiple libraries within a single compilation cycle. Artifacts are bundled into a shared cache folder linked by hyphens (-). It groups combination of libraries and prevents dependency conflict. For example, if an Axum rlib is compiled with Tokio version 1.5.2, while the user inputs that Axum rlib with Tokio rlib 1.5.3, the compiler will throw an error because Axum rlib looks for Tokio 1.5.2 but it is not available. By grouping them, it just needs to pass this rlib group to successfully use compatible Axum and Tokio rlibs.
 * `rlib list`
 Lists all available precompiled library keys stored globally in `~/.rlib/list.json`.
 * `rlib list <file.list>`
